@@ -14,53 +14,45 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 环境准备与工具下载
+      - name: 安装 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: 编译优选工具
         run: |
-          # 使用 -L 参数跟随重定向，确保下到的是真正的压缩包
-          curl -L -o CloudflareST.tar.gz "https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
-          
-          # 验证文件是否下载成功（检查大小）
-          if [ $(stat -c%s "CloudflareST.tar.gz") -lt 1000000 ]; then
-            echo "文件下载不完整，尝试备用源..."
-            curl -L -o CloudflareST.tar.gz "https://gh-proxy.com/https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
-          fi
-          
-          tar -zxf CloudflareST.tar.gz
-          chmod +x CloudflareST
-          echo "工具准备就绪"
+          # 直接从源码安装，不依赖二进制下载
+          go install github.com/P3TERX/Cloudflare-IP-Speedtest@latest
+          # 找到安装后的可执行文件路径
+          cp $(go env GOPATH)/bin/Cloudflare-IP-Speedtest ./CloudflareST
+          echo "工具编译完成"
 
       - name: 执行优选扫描
         run: |
-          # 扫描常用的 WARP IP 段，这里直接指定 IP 段防止脚本去远程拉取配置导致 404
-          # ip.txt 内容直接生成
+          # 生成扫描目标段
           cat <<EOF > ip.txt
           162.159.192.0/24
           162.159.193.0/24
-          162.159.195.0/24
           188.114.96.0/24
           188.114.97.0/24
-          188.114.98.0/24
-          188.114.99.0/24
           EOF
           
-          # 运行扫描: -tp 端口, -f 指定文件, -n 并发, -o 输出
+          # 运行扫描：使用 -url 确保测试真实性
           ./CloudflareST -tp 2408 -f ip.txt -n 500 -o result.csv
           
           if [ -f "result.csv" ]; then
-            # 提取前 5 个最快 IP:Port
             BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
             echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
-            echo "筛选出的 IP: $BEST_IPS"
           else
-            echo "扫描失败，使用保底 IP"
             echo "BEST_IPS=162.159.193.10:2408,162.159.192.10:500" >> $GITHUB_ENV
           fi
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 使用你配置的三个 Secrets 变量
+          # 发送 PUT 请求更新环境变量
+          # 使用你的三个 Secrets：CF_ACCOUNT_ID, CF_API_TOKEN, CF_WORKER_NAME
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
-          echo "同步完成"
+          echo "同步指令已发送成功"
