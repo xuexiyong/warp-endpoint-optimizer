@@ -14,22 +14,20 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Go 环境
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: 编译优选工具
+      - name: 下载并运行优选工具
         run: |
-          # 直接从源码安装，不依赖二进制下载
-          go install github.com/P3TERX/Cloudflare-IP-Speedtest@latest
-          # 找到安装后的可执行文件路径
-          cp $(go env GOPATH)/bin/Cloudflare-IP-Speedtest ./CloudflareST
-          echo "工具编译完成"
+          # 1. 下载 CloudflareST (直接指向编译好的二进制文件压缩包)
+          # 使用 -L 强制跟随重定向，这是之前失败的关键
+          curl -L -o cfst.tar.gz "https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
+          
+          # 2. 解压并赋予权限
+          tar -zxf cfst.tar.gz
+          chmod +x CloudflareST
+          echo "工具准备完成"
 
       - name: 执行优选扫描
         run: |
-          # 生成扫描目标段
+          # 3. 生成扫描目标 (WARP 官方常用段)
           cat <<EOF > ip.txt
           162.159.192.0/24
           162.159.193.0/24
@@ -37,22 +35,24 @@ jobs:
           188.114.97.0/24
           EOF
           
-          # 运行扫描：使用 -url 确保测试真实性
+          # 4. 开始扫描
           ./CloudflareST -tp 2408 -f ip.txt -n 500 -o result.csv
           
+          # 5. 提取前 5 个最快的 IP:Port
           if [ -f "result.csv" ]; then
             BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
             echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
+            echo "选出的 IP: $BEST_IPS"
           else
-            echo "BEST_IPS=162.159.193.10:2408,162.159.192.10:500" >> $GITHUB_ENV
+            echo "扫描失败，使用保底值"
+            echo "BEST_IPS=162.159.193.10:2408" >> $GITHUB_ENV
           fi
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 发送 PUT 请求更新环境变量
-          # 使用你的三个 Secrets：CF_ACCOUNT_ID, CF_API_TOKEN, CF_WORKER_NAME
+          # 6. 使用你的三个 Secrets 同步到 Cloudflare
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
-          echo "同步指令已发送成功"
+          echo "同步完成"
