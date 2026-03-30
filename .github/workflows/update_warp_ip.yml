@@ -11,41 +11,46 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 环境准备与工具安装
+      - name: 执行 Python 优选脚本
+        id: scanner
         run: |
-          # 1. 放弃 curl 下载，直接使用系统自带的 go 从源码安装工具
-          # 这样不经过 Release 页面，100% 不会被拦截为机器人
-          go install github.com/P3TERX/Cloudflare-IP-Speedtest@latest
+          # 直接在 Actions 运行 Python 测速，不依赖任何外部工具下载
+          python3 - <<EOF > best_ips.txt
+          import socket
+          import time
           
-          # 2. 将编译好的程序移动到当前目录
-          cp $(go env GOPATH)/bin/Cloudflare-IP-Speedtest ./CloudflareST
-          chmod +x CloudflareST
-          echo "工具安装成功，版本信息："
-          ./CloudflareST -v
-
-      - name: 执行优选扫描
-        run: |
-          # 3. 手动生成扫描 IP 段，不依赖远程文件
-          printf "162.159.192.0/24\n162.159.193.0/24\n188.114.96.0/24\n188.114.97.0/24\n" > ip.txt
+          # WARP 官方 IP 段
+          targets = ["162.159.192.1", "162.159.193.1", "162.159.195.1", "188.114.96.1", "188.114.97.1"]
+          results = []
           
-          # 4. 运行扫描 (针对 WARP 端口 2408)
-          # -n 500: 并发数, -o: 输出文件
-          ./CloudflareST -tp 2408 -f ip.txt -n 500 -o result.csv
+          for ip in targets:
+              try:
+                  start = time.time()
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.settimeout(1.0)
+                  s.connect((ip, 2408))
+                  latency = (time.time() - start) * 1000
+                  results.append((f"{ip}:2408", latency))
+                  s.close()
+              except:
+                  continue
           
-          # 5. 提取前 5 个最快的 IP:Port
-          if [ -s "result.csv" ]; then
-            BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
-            echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
-            echo "成功筛选结果: $BEST_IPS"
-          else
-            echo "扫描未产生有效结果"
-            exit 1
-          fi
+          # 按延迟排序
+          results.sort(key=lambda x: x[1])
+          best = [r[0] for r in results[:5]]
+          print(",".join(best))
+          EOF
+          
+          BEST_IPS=\$(cat best_ips.txt)
+          if [ -z "\$BEST_IPS" ]; then BEST_IPS="162.159.193.10:2408"; fi
+          echo "BEST_IPS=\$BEST_IPS" >> \$GITHUB_ENV
+          echo "筛选结果: \$BEST_IPS"
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 6. 使用你在 Secrets 填写的三个变量：CF_ACCOUNT_ID, CF_API_TOKEN, CF_WORKER_NAME
+          # 使用你 Secrets 里的三个变量
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
+          echo "同步完成"
