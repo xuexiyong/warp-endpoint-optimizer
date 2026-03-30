@@ -1,8 +1,8 @@
 name: 自动优选 WARP IP 并同步到 CF
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每 6 小时运行一次
-  workflow_dispatch:       # 支持手动点击运行
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -14,35 +14,47 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 运行优选工具
+      - name: 下载优选工具 (多源备份)
         run: |
-          # 1. 下载真正的二进制优选程序 (GitLab 镜像比 GitHub Raw 更稳定)
-          wget -O warp https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-linux-amd64
+          # 尝试多个下载源，确保不会 404
+          URLS=(
+            "https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/latest/download/CloudflareST_linux_amd64.tar.gz"
+            "https://ghproxy.net/https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/latest/download/CloudflareST_linux_amd64.tar.gz"
+          )
           
-          # 检查文件大小，确保不是下载到了 HTML (应该在 10MB 左右)
-          ls -lh warp
-          chmod +x warp
+          for url in "${URLS[@]}"; do
+            echo "尝试下载: $url"
+            if wget -qO CloudflareST.tar.gz "$url"; then
+              tar -zxf CloudflareST.tar.gz && chmod +x CloudflareST && echo "下载成功！" && break
+            fi
+          done
           
-          # 2. 运行优选 (针对中国优化，扫描 100 个节点)
-          # 执行后会生成 result.csv
-          ./warp -n 100 -t 4
+          if [ ! -f "./CloudflareST" ]; then
+            echo "错误：所有下载源均失效！"
+            exit 1
+          fi
+
+      - name: 执行优选扫描
+        run: |
+          # 扫描 Cloudflare 的常用 WARP IP 段
+          # -tp 2408: WARP 默认端口, -url: 测试延迟的地址, -n 500: 并发数
+          ./CloudflareST -tp 2408 -url https://api.cloudflare.com/cdn-cgi/trace -n 500 -o result.csv
           
-          # 3. 提取前 5 个最快的 IP:Port
           if [ -f "result.csv" ]; then
+            # 提取前 5 个最快的 IP:Port (CloudflareST 的结果第一列就是 IP:Port)
             BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
             echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
-            echo "成功选出 IP: $BEST_IPS"
+            echo "筛选结果: $BEST_IPS"
           else
-            echo "错误：未生成结果文件"
-            exit 1
+            echo "扫描失败，使用保底值"
+            echo "BEST_IPS=162.159.193.10:2408,162.159.192.10:500" >> $GITHUB_ENV
           fi
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 使用你在 Secrets 中定义的变量
-          # 动态更新 Worker 中的 WARP_IPS 环境变量
+          # 使用你配置的三个 Secrets 变量
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
-          echo "同步完成，目标 Worker: ${{ secrets.CF_WORKER_NAME }}"
+          echo "同步指令已发送！"
