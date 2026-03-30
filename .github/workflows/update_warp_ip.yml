@@ -4,9 +4,6 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -14,45 +11,44 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载并运行优选工具
+      - name: 环境准备与工具下载
         run: |
-          # 1. 下载 CloudflareST (直接指向编译好的二进制文件压缩包)
-          # 使用 -L 强制跟随重定向，这是之前失败的关键
-          curl -L -o cfst.tar.gz "https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
+          # 1. 换成更直接、带 UA 伪装的下载方式，确保不被 GitHub 拦截为机器人
+          curl -H "User-Agent: Mozilla/5.0" -L -o CloudflareST.tar.gz "https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
           
-          # 2. 解压并赋予权限
-          tar -zxf cfst.tar.gz
+          # 2. 检查文件类型，如果不是 gzip 格式直接报错，不再盲目执行下一步
+          if ! file CloudflareST.tar.gz | grep -q "gzip compressed data"; then
+            echo "下载失败：获取到的不是压缩包文件，尝试备用源..."
+            curl -H "User-Agent: Mozilla/5.0" -L -o CloudflareST.tar.gz "https://gh-proxy.com/https://github.com/P3TERX/Cloudflare-IP-Speedtest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz"
+          fi
+          
+          # 3. 解压
+          tar -zxf CloudflareST.tar.gz
           chmod +x CloudflareST
-          echo "工具准备完成"
+          echo "工具准备就绪"
 
       - name: 执行优选扫描
         run: |
-          # 3. 生成扫描目标 (WARP 官方常用段)
-          cat <<EOF > ip.txt
-          162.159.192.0/24
-          162.159.193.0/24
-          188.114.96.0/24
-          188.114.97.0/24
-          EOF
+          # 4. 生成扫描段
+          printf "162.159.192.0/24\n162.159.193.0/24\n188.114.96.0/24\n188.114.97.0/24\n" > ip.txt
           
-          # 4. 开始扫描
+          # 5. 运行扫描 (针对 WARP 端口 2408)
           ./CloudflareST -tp 2408 -f ip.txt -n 500 -o result.csv
           
-          # 5. 提取前 5 个最快的 IP:Port
-          if [ -f "result.csv" ]; then
+          # 6. 提取前 5 个最快的 IP:Port
+          if [ -s "result.csv" ]; then
             BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
             echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
-            echo "选出的 IP: $BEST_IPS"
+            echo "成功筛选: $BEST_IPS"
           else
-            echo "扫描失败，使用保底值"
-            echo "BEST_IPS=162.159.193.10:2408" >> $GITHUB_ENV
+            echo "未生成有效结果，停止同步"
+            exit 1
           fi
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 6. 使用你的三个 Secrets 同步到 Cloudflare
+          # 7. 使用你的三个 Secrets：CF_ACCOUNT_ID, CF_API_TOKEN, CF_WORKER_NAME
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/${{ secrets.CF_WORKER_NAME }}/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
-          echo "同步完成"
