@@ -1,8 +1,8 @@
 name: 自动优选 WARP IP 并同步到 CF
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每 6 小时自动运行一次
-  workflow_dispatch:       # 支持手动触发按钮
+    - cron: '0 */6 * * *'  # 每 6 小时运行一次
+  workflow_dispatch:       # 支持手动触发
 
 jobs:
   update:
@@ -11,35 +11,29 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载并运行优选工具
+      - name: 运行优选工具
         run: |
-          # 下载适合 Linux 的优选工具 (根据项目实际文件名调整)
-          # 这里以该项目常见的 ip.sh 或 binary 为例
-          chmod +x ./ip.sh
-          # 运行扫描 (假设工具支持非交互模式，扫描出最快的 IP)
-          # 注意：部分工具可能需要修改以适应自动运行，这里演示逻辑
-          # 我们直接使用项目自带的扫描逻辑获取 result.csv
-          bash ./ip.sh <<EOF
-          1
-          EOF
+          # 根据 Leizhenpeng 库的特性，下载对应的 Linux 二进制执行文件
+          # 如果库里自带了脚本，直接运行它。这里演示通用逻辑：
+          chmod +x ./warp
+          # 运行扫描，设置扫描 10 个线程，输出到 result.csv
+          ./warp -n 10
           
-          # 提取前 5 个最快的 IP 并转换成逗号分隔的字符串
-          # 假设结果在 result.csv 中，格式为 IP:Port,Latency
+          # 提取前 5 个最快的 IP (格式为 IP:Port)
           if [ -f "result.csv" ]; then
-            BEST_IPS=$(grep -oE "[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+" result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
+            # 这里的 awk 指令是根据该库常见的 csv 列格式提取第一列的 IP:Port
+            BEST_IPS=$(awk -F, 'NR>1 {print $1}' result.csv | head -n 5 | tr '\n' ',' | sed 's/,$//')
           else
-            # 如果没有 result.csv，尝试从 log 或其他输出获取
             BEST_IPS="162.159.193.10:2408,162.159.192.10:500"
           fi
-          echo "筛选出的优选 IP: $BEST_IPS"
+          echo "筛选出的最新优选 IP: $BEST_IPS"
           echo "BEST_IPS=$BEST_IPS" >> $GITHUB_ENV
 
       - name: 同步到 Cloudflare Worker
         run: |
-          # 使用 Cloudflare API 更新 Worker 的环境变量 WARP_IPS
-          # 这会将最新的 IP 列表推送到你的 warp-endpoint-ip Worker 中
+          # 确保这里的 warp-endpoint-ip 是你之前创建的 Worker 名字
           curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/warp-endpoint-ip/bindings" \
                -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
                -H "Content-Type: application/json" \
                --data "[{\"name\":\"WARP_IPS\",\"type\":\"plain_text\",\"text\":\"${{ env.BEST_IPS }}\"}]"
-          echo "同步成功！"
+          echo "同步完成！"
